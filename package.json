@@ -1,0 +1,12 @@
+{
+  "name": "rancor-menu",
+  "version": "1.0.0",
+  "description": "Rancor Menu \u2014 SWGOH guild strike tracking bot for TB, TW, and raids.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3"
+  }
+}
