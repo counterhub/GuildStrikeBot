@@ -21,7 +21,7 @@ if (!BOT_TOKEN) {
 // These three should already be correct for your setup:
 const CLIENT_ID = "1442232219652325436";      // Application (client) ID
 const GUILD_ID = "544629940640424336";        // Your Discord server ID
-const OFFICER_ROLE_ID = "433126112265109505"; // CARB Officer role ID
+const OFFICER_ROLE_ID = "1350503552178589797"; // CARB Officer role ID
 
 // New config:
 // How long strikes last before expiring (in days)
