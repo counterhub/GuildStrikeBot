@@ -1,14 +1,12 @@
 // Rancor Menu / GuildStrikeBot – SWGOH Strike Tracking Bot
-// Tracks guild member strikes for TB, TW, and Raids using slash commands.
+// FINAL VERSION: No dropdown reason. Uses (member, mode, note).
+// Keeps 30-day reset + 5-strike officer ping. No owner re-auth required.
 
 const fs = require("fs");
 const path = require("path");
 const {
   Client,
   GatewayIntentBits,
-  REST,
-  Routes,
-  SlashCommandBuilder,
 } = require("discord.js");
 
 // ====== CONFIG ======
@@ -18,17 +16,14 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-// These three should already be correct for your setup:
-const CLIENT_ID = "1442232219652325436";      // Application (client) ID
-const GUILD_ID = "544629940640424336";        // Your Discord server ID
-const OFFICER_ROLE_ID = "1350503552178589797"; // CARB Officer role ID
+// These values are correct and already inserted:
+const CLIENT_ID = "1442232219652325436";             // Application ID
+const GUILD_ID = "544629940640424336";               // Server ID
+const OFFICER_ROLE_ID = "1350503552178589797";       // Your Officer Role ID
+const OFFICER_REVIEW_CHANNEL_ID = "1388904994270351520"; // 5-strike alert channel
 
-// New config:
-// How long strikes last before expiring (in days)
+// How long strikes last before expiring
 const STRIKE_EXPIRY_DAYS = 30;
-
-// Channel to ping when someone hits 5 strikes (officer review channel)
-const OFFICER_REVIEW_CHANNEL_ID = "1388904994270351520";
 
 // ====== STRIKE STORAGE ======
 const STRIKES_FILE = path.join(__dirname, "strikes.json");
@@ -37,11 +32,8 @@ function loadStrikes() {
   try {
     const raw = fs.readFileSync(STRIKES_FILE, "utf8");
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object") {
-      return parsed;
-    }
-    return {};
-  } catch (e) {
+    return (parsed && typeof parsed === "object") ? parsed : {};
+  } catch {
     return {};
   }
 }
@@ -54,10 +46,9 @@ function saveStrikes(data) {
   }
 }
 
-// Shape: strikesData[guildId][userId] = { total: number, history: [...] }
 let strikesData = loadStrikes();
 
-// Remove strikes older than STRIKE_EXPIRY_DAYS
+// ===== AUTO-PRUNE 30-DAY OLD STRIKES =====
 function pruneOldStrikes() {
   const cutoff = Date.now() - STRIKE_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
 
@@ -66,18 +57,13 @@ function pruneOldStrikes() {
 
     for (const userId of Object.keys(guild)) {
       const record = guild[userId];
-      if (!record.history || !record.history.length) {
-        delete guild[userId];
-        continue;
-      }
 
-      const newHistory = record.history.filter((entry) => {
+      const newHistory = (record.history || []).filter(entry => {
         const t = Date.parse(entry.date);
-        if (Number.isNaN(t)) return true; // if date is bad, keep it
-        return t >= cutoff;
+        return !Number.isNaN(t) && t >= cutoff;
       });
 
-      if (!newHistory.length) {
+      if (newHistory.length === 0) {
         delete guild[userId];
       } else {
         record.history = newHistory;
@@ -85,7 +71,7 @@ function pruneOldStrikes() {
       }
     }
 
-    if (!Object.keys(guild).length) {
+    if (Object.keys(guild).length === 0) {
       delete strikesData[guildId];
     }
   }
@@ -93,12 +79,14 @@ function pruneOldStrikes() {
   saveStrikes(strikesData);
 }
 
-// Prune once on startup
 pruneOldStrikes();
 
 // ====== DISCORD CLIENT ======
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+  ],
 });
 
 // ====== PERMISSION CHECK ======
@@ -107,157 +95,57 @@ function isOfficer(interaction) {
   if (!member) return false;
 
   // Guild owner always allowed
-  if (interaction.guild && interaction.guild.ownerId === interaction.user.id) {
-    return true;
-  }
+  if (interaction.guild.ownerId === interaction.user.id) return true;
 
-  // Normal case: member has officer role
-  if (member.roles && member.roles.cache) {
-    return member.roles.cache.has(OFFICER_ROLE_ID);
-  }
-
-  return false;
+  return member.roles?.cache?.has(OFFICER_ROLE_ID);
 }
 
-// ====== SLASH COMMANDS ======
-const strikeCommand = new SlashCommandBuilder()
-  .setName("strike")
-  .setDescription("Manage guild strikes")
-  .addSubcommand((sub) =>
-    sub
-      .setName("add")
-      .setDescription("Add a strike to a member.")
-      .addUserOption((option) =>
-        option
-          .setName("member")
-          .setDescription("Guild member to strike")
-          .setRequired(true)
-      )
-      .addStringOption((option) =>
-        option
-          .setName("mode")
-          .setDescription("Game mode for this strike")
-          .setRequired(true)
-          .addChoices(
-            { name: "Territory Battle", value: "tb" },
-            { name: "Territory War", value: "tw" },
-            { name: "Raid", value: "raid" }
-          )
-      )
-      .addStringOption((option) =>
-        option
-          .setName("reason")
-          .setDescription("Reason for the strike")
-          .setRequired(true)
-          .addChoices(
-            { name: "TW - no offense", value: "TW - no offense" },
-            { name: "TW - no defense", value: "TW - no defense" },
-            { name: "TB - no deploy", value: "TB - no deploy" },
-            { name: "Raid - zero damage", value: "Raid - zero damage" },
-            { name: "Other", value: "Other" }
-          )
-      )
-      .addStringOption((option) =>
-        option
-          .setName("note")
-          .setDescription("Optional extra details")
-          .setRequired(false)
-      )
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("member")
-      .setDescription("Check strikes for a member.")
-      .addUserOption((option) =>
-        option
-          .setName("member")
-          .setDescription("Member to check")
-          .setRequired(true)
-      )
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("reset")
-      .setDescription("Reset strikes for a member.")
-      .addUserOption((option) =>
-        option
-          .setName("member")
-          .setDescription("Member to reset")
-          .setRequired(true)
-      )
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("resetall")
-      .setDescription("Reset ALL strikes in this guild (officers only).")
-  );
-
-const commands = [strikeCommand.toJSON()];
-
-// ====== REGISTER COMMANDS ======
-async function registerCommands() {
-  const rest = new REST({ version: "10" }).setToken(BOT_TOKEN);
-  try {
-    console.log("Registering /strike commands for guild:", GUILD_ID);
-    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
-      body: commands,
-    });
-    console.log("Slash commands registered.");
-  } catch (err) {
-    console.error("Error registering commands:", err);
-  }
-}
-
-// ====== EVENT HANDLERS ======
+// ====== BOT READY ======
 client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
-  registerCommands();
+  console.log("Strike bot READY. No slash command registration required.");
 });
 
+// ====== COMMAND HANDLER ======
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== "strike") return;
 
-  // keep data fresh
   pruneOldStrikes();
 
-  const sub = interaction.options.getSubcommand();
   const guildId = interaction.guildId;
+  const sub = interaction.options.getSubcommand();
 
   if (!guildId) {
     return interaction.reply({
-      content: "This command can only be used in a server.",
+      content: "This command can only be used inside a guild.",
       ephemeral: true,
     });
   }
 
-  if (!strikesData[guildId]) {
-    strikesData[guildId] = {};
-  }
+  if (!strikesData[guildId]) strikesData[guildId] = {};
 
   try {
+    // ===== /strike add =====
     if (sub === "add") {
       if (!isOfficer(interaction)) {
-        await interaction.reply({
+        return interaction.reply({
           content: "You don’t have permission to add strikes.",
           ephemeral: true,
         });
-        return;
       }
 
-      const user = interaction.options.getUser("member", true);
+      const target = interaction.options.getUser("member", true);
       const mode = interaction.options.getString("mode", true);
-      const reason = interaction.options.getString("reason", true);
-      const extra = interaction.options.getString("note") || "";
-      const note = extra ? `${reason} - ${extra}` : reason;
+      const note = interaction.options.getString("note") || ""; // optional
 
-      if (!strikesData[guildId][user.id]) {
-        strikesData[guildId][user.id] = { total: 0, history: [] };
+      if (!strikesData[guildId][target.id]) {
+        strikesData[guildId][target.id] = { total: 0, history: [] };
       }
 
-      const entry = strikesData[guildId][user.id];
-      entry.total += 1;
-      entry.history.push({
+      const record = strikesData[guildId][target.id];
+      record.total += 1;
+      record.history.push({
         date: new Date().toISOString(),
         mode,
         note,
@@ -266,93 +154,77 @@ client.on("interactionCreate", async (interaction) => {
 
       saveStrikes(strikesData);
 
-      // Pretty mode name
       const modePretty =
-        mode === "tb"
-          ? "Territory Battle"
-          : mode === "tw"
-          ? "Territory War"
-          : mode === "raid"
-          ? "Raid"
-          : mode;
+        mode === "tb" ? "Territory Battle" :
+        mode === "tw" ? "Territory War" :
+        mode === "raid" ? "Raid" : mode;
 
-      // If this member just hit 5 strikes, notify officers
-      if (entry.total === 5 && OFFICER_REVIEW_CHANNEL_ID) {
+      // 5-strike alert
+      if (record.total === 5) {
         try {
-          const reviewChannel = await interaction.client.channels.fetch(
-            OFFICER_REVIEW_CHANNEL_ID
-          );
-          if (reviewChannel) {
-            await reviewChannel.send(
-              `⚠️ ${user} has reached **5 strikes**. Time to review them for the Rancor.`
-            );
-          }
-        } catch (err) {
-          console.error("Failed to send 5-strike alert:", err);
-        }
+          const ch = await interaction.client.channels.fetch(OFFICER_REVIEW_CHANNEL_ID);
+          await ch.send(`⚠️ ${target} has reached **5 strikes**. Review for Rancor.`);
+        } catch (e) {}
       }
 
-      await interaction.reply(
-        `⚠️ Strike added for ${user} (${modePretty}). Total strikes (last ${STRIKE_EXPIRY_DAYS} days): **${entry.total}**.`
+      return interaction.reply(
+        `⚠️ Strike added for ${target} (${modePretty}${note ? ` – ${note}` : ""}). Total: **${record.total}**.`
       );
-    } else if (sub === "member") {
+    }
+
+    // ===== /strike member =====
+    if (sub === "member") {
       const user = interaction.options.getUser("member", true);
       const record = strikesData[guildId][user.id];
 
       if (!record || !record.total) {
-        await interaction.reply(
-          `${user} currently has **0** strikes in the last ${STRIKE_EXPIRY_DAYS} days.`
-        );
-      } else {
-        await interaction.reply(
-          `${user} currently has **${record.total}** strike${
-            record.total === 1 ? "" : "s"
-          } in the last ${STRIKE_EXPIRY_DAYS} days.`
-        );
+        return interaction.reply(`${user} has **0** strikes (last 30 days).`);
       }
-    } else if (sub === "reset") {
+
+      return interaction.reply(
+        `${user} has **${record.total}** strike${record.total === 1 ? "" : "s"} (last 30 days).`
+      );
+    }
+
+    // ===== /strike reset =====
+    if (sub === "reset") {
       if (!isOfficer(interaction)) {
-        await interaction.reply({
+        return interaction.reply({
           content: "You don’t have permission to reset strikes.",
           ephemeral: true,
         });
-        return;
       }
 
       const user = interaction.options.getUser("member", true);
-      if (strikesData[guildId]) {
-        delete strikesData[guildId][user.id];
-        saveStrikes(strikesData);
-      }
+      delete strikesData[guildId][user.id];
+      saveStrikes(strikesData);
 
-      await interaction.reply(
-        `✅ Strikes reset for ${user}. They now have **0** strikes.`
+      return interaction.reply(
+        `✅ Strikes reset for ${user}.`
       );
-    } else if (sub === "resetall") {
+    }
+
+    // ===== /strike resetall =====
+    if (sub === "resetall") {
       if (!isOfficer(interaction)) {
-        await interaction.reply({
-          content: "You don’t have permission to reset all strikes.",
+        return interaction.reply({
+          content: "You don’t have permission to reset ALL strikes.",
           ephemeral: true,
         });
-        return;
       }
 
       strikesData[guildId] = {};
       saveStrikes(strikesData);
 
-      await interaction.reply(
-        `✅ All strikes for this guild have been reset.`
-      );
+      return interaction.reply("✅ All strikes have been reset for this guild.");
     }
+
   } catch (err) {
-    console.error("Error handling /strike command:", err);
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({
-        content:
-          "❌ Something went wrong while handling this command. Try again in a moment.",
-        ephemeral: true,
-      });
-    }
+    console.error("Command error:", err);
+    return interaction.reply({
+      content: "❌ Something went wrong. Try again.",
+      ephemeral: true,
+    });
   }
 });
 
