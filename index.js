@@ -18,7 +18,7 @@ const {
 const BOT_TOKEN = process.env.BOT_TOKEN;      
 const CLIENT_ID = "1442232219652325436";
 const GUILD_ID = "544692940644024336";
-const OFFICER_ROLE_ID = "433126112265109505";
+const OFFICER_ROLE_ID = "1350503552178589797";
 
 const STRIKES_FILE = path.join(__dirname, "strikes.json");
 
