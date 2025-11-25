@@ -14,7 +14,7 @@ const {
 /**
  *  >>>>> EDIT THESE FOUR VALUES BEFORE RUNNING <<<<<
  *
- * 
+ */ 
 const BOT_TOKEN = process.env.BOT_TOKEN;      
 const CLIENT_ID = "1442232219652325436";
 const GUILD_ID = "544692940644024336";
