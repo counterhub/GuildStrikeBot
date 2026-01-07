@@ -1,31 +1,26 @@
-/**
- * Rancor Menu — Strike Bot (discord.js v14) — FINAL index.js
- *
- * What this bot does (your requirements):
- * - 30-day rolling expiry per strike (each strike expires 30 days after it was added)
- * - Commands are under /strikes (plural)
- * - Everyone can look up themselves
- * - Officers can: add strikes, view all, view any member, reset member, reset all
- * - When a member reaches 5 active strikes, bot pings officers in the officer review channel
- * - Strike activity is posted to your dedicated strike log channel
- *
- * Commands:
- *   Everyone:
- *     /strikes me
- *   Officers only (OFFICER_ROLE_ID):
- *     /strikes add member:<user> mode:<tb|tw|raid> note:<optional>
- *     /strikes member member:<user>
- *     /strikes all
- *     /strikes reset member:<user>
- *     /strikes resetall confirm:YES
- *
- * Hosting:
- * - Railway
- * - Set BOT_TOKEN in Railway Variables
- *
- * NOTE ON STORAGE:
- * - This uses a local strikes.json file. Without a persistent volume, data may reset on redeploy.
- */
+// Rancor Menu — Strike Bot (discord.js v14) — FINAL SINGLE-FILE index.js
+//
+// Commands:
+//   Officers:
+//     /strike add member:<user> mode:<TW|TB|Raid> note:<optional>
+//     /strike reset member:<user>
+//     /strike resetall confirm:YES
+//     /strikes all
+//
+//   Everyone:
+//     /strikes me
+//
+// Behavior:
+// - Rolling expiry: each strike expires after 30 days from when it was added
+// - Any strike added/reset/resetall logs to STRIKE_LOG_CHANNEL_ID
+// - /strikes all posts the full active list into STRIKE_LOG_CHANNEL_ID (and confirms ephemerally)
+// - When a member reaches 5 active strikes, bot pings OFFICER_REVIEW_CHANNEL_ID (and @Officer role)
+// - BOT_TOKEN comes from Railway environment variables
+//
+// IMPORTANT NOTE (Railway):
+// - This uses a local strikes.json file. If your Railway service redeploys onto a new container without
+//   persistent storage, strikes.json can reset. If you want true persistence, add a Railway Volume and
+//   point STRIKES_FILE to that mounted path (tell me and I’ll wire it cleanly).
 
 const fs = require("fs");
 const path = require("path");
@@ -37,7 +32,13 @@ const {
   SlashCommandBuilder,
 } = require("discord.js");
 
-// ===================== YOUR NUMBERS (LOCKED) =====================
+// ===================== CONFIG (YOUR NUMBERS) =====================
+const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) {
+  console.error("Missing BOT_TOKEN environment variable. Set it in Railway Variables.");
+  process.exit(1);
+}
+
 const CLIENT_ID = "1442232219652325436";
 const GUILD_ID = "544629940640424336";
 
@@ -45,43 +46,22 @@ const OFFICER_ROLE_ID = "1350503552178589797";
 const OFFICER_REVIEW_CHANNEL_ID = "1388904994270351520";
 const STRIKE_LOG_CHANNEL_ID = "1451024629333495919";
 
-// 30-day rolling expiry (hard-coded so it can’t be blank)
 const STRIKE_EXPIRY_DAYS = 30;
+const STRIKE_REVIEW_THRESHOLD = 5;
 
-// Threshold to ping officers
-const REVIEW_THRESHOLD = 5;
-
-// Railway env var
-const BOT_TOKEN = process.env.BOT_TOKEN;
-if (!BOT_TOKEN) {
-  console.error("Missing BOT_TOKEN environment variable. Set it in Railway Variables.");
-  process.exit(1);
-}
-
-// Local storage file
 const STRIKES_FILE = path.join(__dirname, "strikes.json");
+// ================================================================
 
-// ===================== STORAGE HELPERS =====================
-// Data shape (guild-scoped):
-// {
-//   "544629940640424336": {
-//     "123456789012345678": {
-//       "history": [
-//         { "ts": 1710000000000, "mode": "tb", "note": "no deploy", "by": "officerUserId" }
-//       ]
-//     }
-//   }
-// }
-
+// --------------------- Storage helpers --------------------------
 function safeReadJson(filePath) {
   try {
     if (!fs.existsSync(filePath)) return {};
     const raw = fs.readFileSync(filePath, "utf8");
-    if (!raw || !raw.trim()) return {};
+    if (!raw.trim()) return {};
     const parsed = JSON.parse(raw);
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch (e) {
-    console.error("Failed reading JSON:", e?.message || e);
+    console.error("Failed reading strikes JSON:", e);
     return {};
   }
 }
@@ -89,10 +69,8 @@ function safeReadJson(filePath) {
 function safeWriteJson(filePath, obj) {
   try {
     fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf8");
-    return true;
   } catch (e) {
-    console.error("Failed writing JSON:", e?.message || e);
-    return false;
+    console.error("Failed writing strikes JSON:", e);
   }
 }
 
@@ -100,48 +78,37 @@ function daysToMs(days) {
   return days * 24 * 60 * 60 * 1000;
 }
 
-function cutoffMs() {
-  return Date.now() - daysToMs(STRIKE_EXPIRY_DAYS);
+function isActiveStrike(strike) {
+  if (!strike || !strike.date) return false;
+  const t = Date.parse(strike.date);
+  if (Number.isNaN(t)) return false;
+  return Date.now() - t <= daysToMs(STRIKE_EXPIRY_DAYS);
 }
 
-function ensureGuild(data, guildId) {
-  if (!data[guildId]) data[guildId] = {};
-  return data[guildId];
-}
+function pruneGuildData(data, guildId) {
+  if (!data[guildId]) return false;
 
-function ensureEntry(data, guildId, userId) {
-  const g = ensureGuild(data, guildId);
-  if (!g[userId]) g[userId] = { history: [] };
-  if (!Array.isArray(g[userId].history)) g[userId].history = [];
-  return g[userId];
-}
-
-function pruneExpired(data, guildId) {
-  const g = data[guildId];
-  if (!g) return false;
-
-  const cut = cutoffMs();
   let changed = false;
+  const bucket = data[guildId];
 
-  for (const userId of Object.keys(g)) {
-    const entry = g[userId];
-    if (!entry || !Array.isArray(entry.history)) {
-      delete g[userId];
-      changed = true;
-      continue;
-    }
+  for (const userId of Object.keys(bucket)) {
+    const entry = bucket[userId];
+    const before = Array.isArray(entry.history) ? entry.history.length : 0;
+    const hist = Array.isArray(entry.history) ? entry.history : [];
 
-    const before = entry.history.length;
-    entry.history = entry.history.filter((s) => s && typeof s.ts === "number" && s.ts >= cut);
-    if (entry.history.length !== before) changed = true;
+    const kept = hist.filter(isActiveStrike);
+    if (kept.length !== before) changed = true;
 
-    if (entry.history.length === 0) {
-      delete g[userId];
+    entry.history = kept;
+    entry.total = kept.length;
+
+    if (entry.total <= 0) {
+      delete bucket[userId];
       changed = true;
     }
   }
 
-  if (Object.keys(g).length === 0) {
+  if (Object.keys(bucket).length === 0) {
     delete data[guildId];
     changed = true;
   }
@@ -149,29 +116,50 @@ function pruneExpired(data, guildId) {
   return changed;
 }
 
-function getCount(data, guildId, userId) {
-  const g = data[guildId];
-  if (!g || !g[userId] || !Array.isArray(g[userId].history)) return 0;
-  return g[userId].history.length;
+function loadAllStrikes() {
+  const data = safeReadJson(STRIKES_FILE);
+  // prune configured guild on every load to keep behavior consistent
+  const changed = pruneGuildData(data, GUILD_ID);
+  if (changed) safeWriteJson(STRIKES_FILE, data);
+  return data;
 }
 
-// ===================== DISCORD HELPERS =====================
+function saveAllStrikes(data) {
+  // prune before save to ensure totals are correct
+  pruneGuildData(data, GUILD_ID);
+  safeWriteJson(STRIKES_FILE, data);
+}
+
+function getGuildBucket(data, guildId) {
+  if (!data[guildId]) data[guildId] = {};
+  return data[guildId];
+}
+
+function getEntry(data, guildId, userId) {
+  const bucket = getGuildBucket(data, guildId);
+  if (!bucket[userId]) bucket[userId] = { history: [], total: 0 };
+  if (!Array.isArray(bucket[userId].history)) bucket[userId].history = [];
+  bucket[userId].history = bucket[userId].history.filter(isActiveStrike);
+  bucket[userId].total = bucket[userId].history.length;
+  return bucket[userId];
+}
+
+// --------------------- Discord helpers --------------------------
 function isOfficer(interaction) {
   const roles = interaction.member?.roles;
-  if (!roles || !roles.cache) return false;
-  return roles.cache.has(OFFICER_ROLE_ID);
+  if (!roles) return false;
+
+  if (roles.cache && typeof roles.cache.has === "function") {
+    return roles.cache.has(OFFICER_ROLE_ID);
+  }
+
+  // fallback
+  if (Array.isArray(roles)) return roles.includes(OFFICER_ROLE_ID);
+  return false;
 }
 
-function modeLabel(mode) {
-  if (mode === "tb") return "Territory Battle";
-  if (mode === "tw") return "Territory War";
-  return "Raid";
-}
-
-function formatStrikeLine(s) {
-  const when = new Date(s.ts).toLocaleString();
-  const note = s.note ? ` — ${s.note}` : "";
-  return `• **${modeLabel(s.mode)}** — ${when}${note}`;
+function mentionRole(roleId) {
+  return `<@&${roleId}>`;
 }
 
 async function sendToChannel(client, channelId, content) {
@@ -181,40 +169,33 @@ async function sendToChannel(client, channelId, content) {
     await ch.send(content);
     return true;
   } catch (e) {
-    console.error("Failed to send to channel:", channelId, e?.message || e);
+    console.error(`Failed to send to channel ${channelId}:`, e?.message || e);
     return false;
   }
 }
 
-function chunkTextLines(header, lines, maxLen = 1900) {
-  const chunks = [];
-  let cur = header;
-
-  for (const line of lines) {
-    const next = cur + (cur.endsWith("\n") ? "" : "\n") + line;
-    if (next.length > maxLen) {
-      chunks.push(cur);
-      cur = header + line;
-    } else {
-      cur = next;
-    }
-  }
-
-  if (cur && cur.trim().length) chunks.push(cur);
-  return chunks;
+function prettyMode(mode) {
+  if (mode === "tw") return "Territory War";
+  if (mode === "tb") return "Territory Battle";
+  if (mode === "raid") return "Raid";
+  return String(mode || "").toUpperCase();
 }
 
-// ===================== SLASH COMMANDS =====================
-const strikesCmd = new SlashCommandBuilder()
-  .setName("strikes")
-  .setDescription("Strike tracking (Rancor Menu)")
-  .addSubcommand((sub) =>
-    sub.setName("me").setDescription("Show your active strikes (last 30 days)")
-  )
+function formatStrikeLine(s) {
+  const d = new Date(s.date);
+  const when = Number.isNaN(d.getTime()) ? s.date : d.toLocaleString();
+  const note = s.note ? ` — ${s.note}` : "";
+  return `• **${prettyMode(s.mode)}** — ${when}${note}`;
+}
+
+// --------------------- Slash commands ---------------------------
+const strikeCmd = new SlashCommandBuilder()
+  .setName("strike")
+  .setDescription("Officer strike actions")
   .addSubcommand((sub) =>
     sub
       .setName("add")
-      .setDescription("Add a strike to a member (officers only)")
+      .setDescription("Add a strike (officers only)")
       .addUserOption((opt) =>
         opt.setName("member").setDescription("Member").setRequired(true)
       )
@@ -224,30 +205,14 @@ const strikesCmd = new SlashCommandBuilder()
           .setDescription("Mode")
           .setRequired(true)
           .addChoices(
-            { name: "Territory Battle", value: "tb" },
             { name: "Territory War", value: "tw" },
+            { name: "Territory Battle", value: "tb" },
             { name: "Raid", value: "raid" }
           )
       )
       .addStringOption((opt) =>
-        opt
-          .setName("note")
-          .setDescription("Optional note (ex: no deploy, no offense, no defense, zero)")
-          .setRequired(false)
+        opt.setName("note").setDescription("Optional note").setRequired(false)
       )
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("member")
-      .setDescription("Show strikes for a member (officers only)")
-      .addUserOption((opt) =>
-        opt.setName("member").setDescription("Member").setRequired(true)
-      )
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("all")
-      .setDescription("List everyone with active strikes (officers only)")
   )
   .addSubcommand((sub) =>
     sub
@@ -260,7 +225,7 @@ const strikesCmd = new SlashCommandBuilder()
   .addSubcommand((sub) =>
     sub
       .setName("resetall")
-      .setDescription("Reset ALL strikes (officers only, dangerous)")
+      .setDescription("Reset ALL strikes (officers only)")
       .addStringOption((opt) =>
         opt
           .setName("confirm")
@@ -270,19 +235,26 @@ const strikesCmd = new SlashCommandBuilder()
       )
   );
 
-async function registerGuildCommandsForce() {
+const strikesCmd = new SlashCommandBuilder()
+  .setName("strikes")
+  .setDescription("View strikes")
+  .addSubcommand((sub) =>
+    sub.setName("me").setDescription("Show your active strikes (last 30 days)")
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("all")
+      .setDescription("List everyone with active strikes (officers only)")
+  );
+
+async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(BOT_TOKEN);
-
-  // Force refresh so new subcommands (like /strikes all) actually appear:
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: [] });
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
-    body: [strikesCmd.toJSON()],
-  });
-
-  console.log(`Registered guild commands: /strikes (guild ${GUILD_ID})`);
+  const body = [strikeCmd.toJSON(), strikesCmd.toJSON()];
+  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body });
+  console.log("Slash commands registered.");
 }
 
-// ===================== CLIENT =====================
+// --------------------- Client --------------------------
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
@@ -290,21 +262,24 @@ const client = new Client({
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
+  // Quick sanity checks (non-fatal)
+  await sendToChannel(
+    client,
+    STRIKE_LOG_CHANNEL_ID,
+    "✅ Strike bot online."
+  );
+
   try {
-    await registerGuildCommandsForce();
+    await registerCommands();
   } catch (e) {
     console.error("Command registration failed:", e?.message || e);
   }
-
-  // Optional: show in logs channel that bot is up (helps verify channel IDs)
-  await sendToChannel(client, STRIKE_LOG_CHANNEL_ID, "✅ Rancor Menu Strike Bot online.");
 });
 
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName !== "strikes") return;
 
-  // Hard lock to your configured guild
+  // Ensure this bot only operates in the configured guild
   if (interaction.guildId !== GUILD_ID) {
     try {
       await interaction.reply({ content: "This bot is not configured for this server.", ephemeral: true });
@@ -312,207 +287,206 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  // Acknowledge quickly to avoid timeouts
+  // Always ack quickly to avoid Discord timeout
   try {
     await interaction.deferReply({ ephemeral: true });
   } catch (_) {}
 
-  const sub = interaction.options.getSubcommand();
+  // Load/prune strikes every interaction
+  const data = loadAllStrikes();
+  const bucket = getGuildBucket(data, GUILD_ID);
 
-  // Load + prune (rolling 30-day window)
-  const data = safeReadJson(STRIKES_FILE);
-  const changed = pruneExpired(data, GUILD_ID);
-  if (changed) safeWriteJson(STRIKES_FILE, data);
-
-  const g = ensureGuild(data, GUILD_ID);
-
-  // ===================== /strikes me (everyone) =====================
-  if (sub === "me") {
-    const userId = interaction.user.id;
-    const entry = g[userId];
-
-    if (!entry || !Array.isArray(entry.history) || entry.history.length === 0) {
-      await interaction.editReply(`You have **0** active strikes (rolling **${STRIKE_EXPIRY_DAYS} days**).`);
+  // ---------------- /strike ... (officers only) ----------------
+  if (interaction.commandName === "strike") {
+    if (!isOfficer(interaction)) {
+      await interaction.editReply("Officers only.");
       return;
     }
 
-    const hist = entry.history
-      .slice()
-      .sort((a, b) => b.ts - a.ts)
-      .slice(0, 15);
+    const sub = interaction.options.getSubcommand();
 
-    const lines = hist.map(formatStrikeLine);
-    const total = entry.history.length;
-    const more = total > 15 ? `\n\n(Showing most recent 15 of ${total}.)` : "";
+    if (sub === "add") {
+      const user = interaction.options.getUser("member", true);
+      const mode = interaction.options.getString("mode", true);
+      const noteRaw = interaction.options.getString("note", false);
+      const note = noteRaw && noteRaw.trim().length ? noteRaw.trim() : null;
 
-    await interaction.editReply(
-      `Your active strikes (rolling **${STRIKE_EXPIRY_DAYS} days**): **${total}**\n\n${lines.join("\n")}${more}`
-    );
-    return;
-  }
+      const entry = getEntry(data, GUILD_ID, user.id);
 
-  // Everything else requires officer role
-  if (!isOfficer(interaction)) {
-    await interaction.editReply("Officers only.");
-    return;
-  }
+      entry.history.push({
+        date: new Date().toISOString(),
+        mode,
+        note: note || undefined,
+        by: interaction.user.id,
+      });
 
-  // ===================== /strikes add =====================
-  if (sub === "add") {
-    const member = interaction.options.getUser("member", true);
-    const mode = interaction.options.getString("mode", true);
-    const note = (interaction.options.getString("note", false) || "").trim();
+      // prune + compute total
+      entry.history = entry.history.filter(isActiveStrike);
+      entry.total = entry.history.length;
 
-    const entry = ensureEntry(data, GUILD_ID, member.id);
-    entry.history.push({
-      ts: Date.now(),
-      mode,
-      note: note || undefined,
-      by: interaction.user.id,
-    });
+      saveAllStrikes(data);
 
-    // prune + save
-    pruneExpired(data, GUILD_ID);
-    safeWriteJson(STRIKES_FILE, data);
-
-    const total = getCount(data, GUILD_ID, member.id);
-
-    await interaction.editReply(
-      `✅ Strike added to ${member}.\nMode: **${modeLabel(mode)}**\nActive strikes (rolling **${STRIKE_EXPIRY_DAYS} days**): **${total}**${note ? `\nNote: ${note}` : ""}`
-    );
-
-    await sendToChannel(
-      client,
-      STRIKE_LOG_CHANNEL_ID,
-      [
-        `🟥 **Strike Added**`,
-        `Member: ${member} (${member.id})`,
-        `Mode: **${modeLabel(mode)}**`,
-        `Note: ${note ? `**${note}**` : "_(none)_"} `,
-        `Active strikes (rolling ${STRIKE_EXPIRY_DAYS} days): **${total}**`,
-        `By: ${interaction.user} (${interaction.user.id})`,
-      ].join("\n")
-    );
-
-    if (total === REVIEW_THRESHOLD) {
-      await sendToChannel(
-        client,
-        OFFICER_REVIEW_CHANNEL_ID,
-        `🚨 <@&${OFFICER_ROLE_ID}> **Review Needed**\n${member} has reached **${REVIEW_THRESHOLD} active strikes** (rolling ${STRIKE_EXPIRY_DAYS} days).`
+      await interaction.editReply(
+        `✅ Strike added to ${user}.\nMode: **${prettyMode(mode)}**\nActive strikes (last ${STRIKE_EXPIRY_DAYS}d): **${entry.total}**${note ? `\nNote: ${note}` : ""}`
       );
-    }
 
-    return;
-  }
-
-  // ===================== /strikes member =====================
-  if (sub === "member") {
-    const member = interaction.options.getUser("member", true);
-    const entry = g[member.id];
-
-    if (!entry || !Array.isArray(entry.history) || entry.history.length === 0) {
-      await interaction.editReply(`${member} has **0** active strikes (rolling **${STRIKE_EXPIRY_DAYS} days**).`);
-      return;
-    }
-
-    const hist = entry.history
-      .slice()
-      .sort((a, b) => b.ts - a.ts)
-      .slice(0, 15);
-
-    const lines = hist.map(formatStrikeLine);
-    const total = entry.history.length;
-    const more = total > 15 ? `\n\n(Showing most recent 15 of ${total}.)` : "";
-
-    await interaction.editReply(
-      `Active strikes for ${member} (rolling **${STRIKE_EXPIRY_DAYS} days**): **${total}**\n\n${lines.join("\n")}${more}`
-    );
-    return;
-  }
-
-  // ===================== /strikes all =====================
-  if (sub === "all") {
-    const rows = Object.entries(g)
-      .map(([userId, entry]) => {
-        const hist = Array.isArray(entry.history) ? entry.history : [];
-        return { userId, total: hist.length };
-      })
-      .filter((r) => r.total > 0)
-      .sort((a, b) => b.total - a.total);
-
-    if (rows.length === 0) {
-      // Log the list request (optional)
+      // Log to strike log channel
       await sendToChannel(
         client,
         STRIKE_LOG_CHANNEL_ID,
-        `📋 **Active Strikes (rolling ${STRIKE_EXPIRY_DAYS} days)**\nNone. (Requested by ${interaction.user})`
+        `🟥 **Strike Added**\nMember: ${user}\nMode: **${prettyMode(mode)}**\nNote: ${note ? `**${note}**` : "_(none)_"}\nActive strikes (last ${STRIKE_EXPIRY_DAYS}d): **${entry.total}**\nBy: ${interaction.user}`
       );
 
-      await interaction.editReply(`✅ No active strikes (rolling **${STRIKE_EXPIRY_DAYS} days**).`);
+      // Threshold ping at 5
+      if (entry.total === STRIKE_REVIEW_THRESHOLD) {
+        await sendToChannel(
+          client,
+          OFFICER_REVIEW_CHANNEL_ID,
+          `🚨 ${mentionRole(OFFICER_ROLE_ID)} **Review Needed**\n${user} has reached **${STRIKE_REVIEW_THRESHOLD} active strikes** (last ${STRIKE_EXPIRY_DAYS} days).`
+        );
+      }
+
       return;
     }
 
-    const header = `📋 **Active Strikes (rolling ${STRIKE_EXPIRY_DAYS} days)** — ${rows.length} member(s)\n`;
-    const lines = rows.map((r) => `• <@${r.userId}> — **${r.total}**`);
+    if (sub === "reset") {
+      const user = interaction.options.getUser("member", true);
 
-    // Post into strike log channel so officers see it in the bot channel (your request)
-    const chunks = chunkTextLines(header, lines);
-    for (const c of chunks) {
-      await sendToChannel(client, STRIKE_LOG_CHANNEL_ID, c);
-    }
-    await sendToChannel(
-      client,
-      STRIKE_LOG_CHANNEL_ID,
-      `Requested by: ${interaction.user} (${interaction.user.id})`
-    );
+      const oldTotal = bucket[user.id] ? (bucket[user.id].history || []).filter(isActiveStrike).length : 0;
+      delete bucket[user.id];
 
-    // Ephemeral confirmation to the command runner
-    await interaction.editReply(`✅ Posted the active strike list in <#${STRIKE_LOG_CHANNEL_ID}>.`);
-    return;
-  }
+      saveAllStrikes(data);
 
-  // ===================== /strikes reset =====================
-  if (sub === "reset") {
-    const member = interaction.options.getUser("member", true);
-    const oldTotal = getCount(data, GUILD_ID, member.id);
+      await interaction.editReply(`✅ Strikes reset for ${user}. Old active total: **${oldTotal}** → **0**`);
 
-    if (g[member.id]) delete g[member.id];
-    safeWriteJson(STRIKES_FILE, data);
+      await sendToChannel(
+        client,
+        STRIKE_LOG_CHANNEL_ID,
+        `🟩 **Strikes Reset**\nMember: ${user}\nOld active total: **${oldTotal}** → **0**\nBy: ${interaction.user}`
+      );
 
-    await interaction.editReply(`✅ Strikes reset for ${member}. Old active total: **${oldTotal}** → **0**`);
-
-    await sendToChannel(
-      client,
-      STRIKE_LOG_CHANNEL_ID,
-      `🟩 **Strikes Reset**\nMember: ${member}\nOld active total: **${oldTotal}** → **0**\nBy: ${interaction.user}`
-    );
-    return;
-  }
-
-  // ===================== /strikes resetall =====================
-  if (sub === "resetall") {
-    const confirm = interaction.options.getString("confirm", true);
-    if (confirm !== "YES") {
-      await interaction.editReply("Cancelled.");
       return;
     }
 
-    const countBefore = Object.keys(g).length;
-    data[GUILD_ID] = {};
-    safeWriteJson(STRIKES_FILE, data);
+    if (sub === "resetall") {
+      const confirm = interaction.options.getString("confirm", true);
+      if (confirm !== "YES") {
+        await interaction.editReply("Cancelled.");
+        return;
+      }
 
-    await interaction.editReply(`✅ ALL strikes reset. Cleared records: **${countBefore}**`);
+      const countBefore = Object.keys(bucket).length;
+      data[GUILD_ID] = {};
+      saveAllStrikes(data);
 
-    await sendToChannel(
-      client,
-      STRIKE_LOG_CHANNEL_ID,
-      `🟧 **RESET ALL**\nCleared records: **${countBefore}**\nBy: ${interaction.user}`
-    );
+      await interaction.editReply(`✅ ALL strikes reset. Cleared records: **${countBefore}**`);
+
+      await sendToChannel(
+        client,
+        STRIKE_LOG_CHANNEL_ID,
+        `🟧 **ALL Strikes Reset**\nCleared records: **${countBefore}**\nBy: ${interaction.user}`
+      );
+
+      return;
+    }
+
+    await interaction.editReply("Unknown /strike subcommand.");
     return;
   }
 
-  // Fallback
-  await interaction.editReply("Unknown subcommand.");
+  // ---------------- /strikes ... ----------------
+  if (interaction.commandName === "strikes") {
+    const sub = interaction.options.getSubcommand();
+
+    // Everyone can check themselves
+    if (sub === "me") {
+      const userId = interaction.user.id;
+      const entry = bucket[userId];
+
+      if (!entry) {
+        await interaction.editReply(`You have **0 active strikes** (last ${STRIKE_EXPIRY_DAYS} days).`);
+        return;
+      }
+
+      // prune for display
+      entry.history = (entry.history || []).filter(isActiveStrike);
+      entry.total = entry.history.length;
+
+      if (entry.total <= 0) {
+        // cleanup
+        delete bucket[userId];
+        saveAllStrikes(data);
+        await interaction.editReply(`You have **0 active strikes** (last ${STRIKE_EXPIRY_DAYS} days).`);
+        return;
+      }
+
+      const sorted = entry.history
+        .slice()
+        .sort((a, b) => Date.parse(b.date) - Date.parse(a.date))
+        .slice(0, 15);
+
+      const lines = sorted.map(formatStrikeLine);
+      const more = entry.total > 15 ? `\n\n(Showing most recent 15 of ${entry.total}.)` : "";
+
+      await interaction.editReply(
+        `Your active strikes (last ${STRIKE_EXPIRY_DAYS} days): **${entry.total}**\n\n${lines.join("\n")}${more}`
+      );
+      return;
+    }
+
+    // Officers-only: list everyone with active strikes
+    if (sub === "all") {
+      if (!isOfficer(interaction)) {
+        await interaction.editReply("Officers only.");
+        return;
+      }
+
+      const rows = Object.entries(bucket)
+        .map(([userId, entry]) => {
+          const hist = Array.isArray(entry.history) ? entry.history.filter(isActiveStrike) : [];
+          const total = hist.length;
+          return { userId, total };
+        })
+        .filter((r) => r.total > 0)
+        .sort((a, b) => b.total - a.total);
+
+      if (!rows.length) {
+        // Post result to the strike log channel as well (requested behavior)
+        await sendToChannel(
+          client,
+          STRIKE_LOG_CHANNEL_ID,
+          `📋 **Active Strikes (last ${STRIKE_EXPIRY_DAYS} days)**\nNone.`
+        );
+        await interaction.editReply("✅ No active strikes.");
+        return;
+      }
+
+      const header = `📋 **Active Strikes (last ${STRIKE_EXPIRY_DAYS} days)** — ${rows.length} member(s)\n`;
+      const lines = rows.map((r) => `• <@${r.userId}> — **${r.total}**`);
+
+      // Post into the strike log channel (so officers can see it in one place)
+      // Chunk to avoid message limits
+      let chunk = header;
+      for (const line of lines) {
+        if ((chunk + "\n" + line).length > 1900) {
+          await sendToChannel(client, STRIKE_LOG_CHANNEL_ID, chunk);
+          chunk = header + line;
+        } else {
+          chunk += (chunk.endsWith("\n") ? "" : "\n") + line;
+        }
+      }
+      await sendToChannel(client, STRIKE_LOG_CHANNEL_ID, chunk);
+
+      // Ephemeral confirmation to the command runner
+      await interaction.editReply(`✅ Posted the active strike list in <#${STRIKE_LOG_CHANNEL_ID}>.`);
+      return;
+    }
+
+    await interaction.editReply("Unknown /strikes subcommand.");
+    return;
+  }
+
+  await interaction.editReply("Unknown command.");
 });
 
 client.login(BOT_TOKEN);
